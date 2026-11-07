@@ -15,12 +15,17 @@
     "tailwind-merge": "3.4.0"
   },
   "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "@tailwindcss/vite": "4.1.17",
     "@types/node": "22.19.17",
+    "@types/pngjs": "^6.0.5",
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "5.1.1",
+    "jpeg-js": "^0.4.4",
+    "pngjs": "^7.0.0",
     "tailwindcss": "4.1.17",
+    "tsx": "^4.23.15",
     "typescript": "5.9.3",
     "vite": "7.3.2",
     "vite-plugin-singlefile": "2.3.0"

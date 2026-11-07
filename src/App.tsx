@@ -1,30 +1,31 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import sampleUrl from "./assets/sample.jpg";
-import { buildSvg, vectorize, type Progress, type VectorOptions, type VectorResult } from "./engine/vectorize";
+import { buildSvg, type Progress, type VectorOptions, type VectorResult } from "./engine/vectorize";
+import { runVectorize } from "./engine/runner";
 
 /* ------------------------------------------------------------------ */
 /*  presets                                                            */
 /* ------------------------------------------------------------------ */
 const PRESETS: Record<string, { label: string; hint: string; o: VectorOptions }> = {
   anime: {
-    label: "Anime cel",
-    hint: "Balanced · flat shading + ink lines",
-    o: { maxColors: 48, iterations: 30, tolerance: 0.6, sigma: 0.6, cornerAngle: 50, minArea: 3, denoise: 1, detail: 0.7, scale: 1 },
+    label: "Pixel-perfect",
+    hint: "Highest fidelity · 100 passes · exact contours",
+    o: { maxColors: 32, iterations: 100, tolerance: 0.15, sigma: 0, cornerAngle: 70, minArea: 0.5, denoise: 0, detail: 1, scale: 1, underlap: 1, lloyd: 2, prune: 0, thin: 0.8, thinGate: 12 },
   },
   lineart: {
     label: "Ink & text",
-    hint: "Thin strokes, lettering, lightning",
-    o: { maxColors: 20, iterations: 30, tolerance: 0.4, sigma: 0.55, cornerAngle: 45, minArea: 1, denoise: 0, detail: 1, scale: 2 },
+    hint: "Lettering, hairlines, small type",
+    o: { maxColors: 16, iterations: 100, tolerance: 0.12, sigma: 0, cornerAngle: 70, minArea: 0.25, denoise: 0, detail: 1, scale: 1, underlap: 1, lloyd: 2, prune: 0, thin: 1, thinGate: 12 },
   },
   max: {
-    label: "Max fidelity",
-    hint: "96 colours · 2× sub-pixel tracing (slow)",
-    o: { maxColors: 96, iterations: 30, tolerance: 0.35, sigma: 0.55, cornerAngle: 50, minArea: 1, denoise: 1, detail: 0.8, scale: 2 },
+    label: "Balanced",
+    hint: "~60% smaller files, still crisp edges",
+    o: { maxColors: 32, iterations: 60, tolerance: 0.3, sigma: 0, cornerAngle: 70, minArea: 1, denoise: 1, detail: 1, scale: 1, underlap: 1, lloyd: 2, prune: 4, thin: 0.8, thinGate: 12 },
   },
   fast: {
     label: "Quick draft",
-    hint: "Small file, seconds to run",
-    o: { maxColors: 24, iterations: 30, tolerance: 1.0, sigma: 0.7, cornerAngle: 60, minArea: 6, denoise: 1, detail: 0.5, scale: 1 },
+    hint: "Tiny file, ~1-2 s",
+    o: { maxColors: 16, iterations: 30, tolerance: 0.6, sigma: 0, cornerAngle: 70, minArea: 3, denoise: 1, detail: 1, scale: 1, underlap: 1, lloyd: 2, prune: 7, thin: 0.6, thinGate: 12 },
   },
 };
 
@@ -107,7 +108,7 @@ function ConvergenceChart({ errors, colors, live }: { errors: number[]; colors: 
   return (
     <div>
       <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-zinc-500">
-        <span>30-pass convergence {live && <span className="ml-1 animate-pulse text-fuchsia-400">● live</span>}</span>
+        <span>Palette convergence {live && <span className="ml-1 animate-pulse text-fuchsia-400">● live</span>}</span>
         <span>
           <span className="text-fuchsia-400">━</span> ΔE error <span className="ml-2 text-cyan-400">╌</span> colours
         </span>
@@ -257,7 +258,7 @@ export default function App() {
 
       const errs: number[] = [];
       const cols: number[] = [];
-      const res = await vectorize(
+      const res = await runVectorize(
         data,
         src.w,
         src.h,
@@ -407,7 +408,7 @@ export default function App() {
             <h1 className="text-sm font-bold leading-none tracking-tight text-white">
               Vector<span className="text-fuchsia-400">Forge</span> <span className="font-normal text-zinc-500">Anime</span>
             </h1>
-            <p className="mt-0.5 text-[11px] text-zinc-500">True-vector tracer · 30-pass CIELAB refinement · stacked Bézier layers</p>
+            <p className="mt-0.5 text-[11px] text-zinc-500">Sub-pixel coverage contours · seam-free underlap stacking · 100-pass CIELAB palette search</p>
           </div>
         </div>
         <div className="hidden items-center gap-2 text-[11px] sm:flex">
@@ -446,6 +447,7 @@ export default function App() {
 
           <section className="space-y-3.5">
             <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Colour engine</h2>
+            <Slider label="Refinement iterations" value={opts.iterations} min={10} max={100} step={5} onChange={(v) => set("iterations", v)} hint="Error-driven palette passes (split worst cluster → Lloyd polish). 100 = deepest search." />
             <Slider label="Palette ceiling" value={opts.maxColors} min={8} max={96} step={1} onChange={(v) => set("maxColors", v)} hint="Colours grow where the error is highest (shadows, skin tones, highlights)." />
             <Slider label="Detail focus" value={opts.detail} min={0} max={1} step={0.05} fmt={(v) => Math.round(v * 100) + "%"} onChange={(v) => set("detail", v)} hint="Boosts thin ink lines, eyelashes, fingers, text and glints in the palette search." />
             <Slider label="Denoise passes" value={opts.denoise} min={0} max={3} step={1} onChange={(v) => set("denoise", v)} hint="Edge-preserving; removes JPEG blocks without blurring lines." />
@@ -454,7 +456,10 @@ export default function App() {
           <section className="space-y-3.5">
             <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Curve engine</h2>
             <Slider label="Curve tolerance" value={opts.tolerance} min={0.15} max={2} step={0.05} fmt={(v) => v.toFixed(2) + " px"} onChange={(v) => set("tolerance", v)} hint="Lower = more nodes, closer to the pixels." />
-            <Slider label="Contour smoothing σ" value={opts.sigma} min={0.4} max={1.4} step={0.05} fmt={(v) => v.toFixed(2)} onChange={(v) => set("sigma", v)} hint="Sub-pixel blur before tracing. Keep ≤0.6 for hairlines." />
+            <Slider label="Contour smoothing σ" value={opts.sigma} min={0} max={1} step={0.05} fmt={(v) => (v === 0 ? "off (exact)" : v.toFixed(2))} onChange={(v) => set("sigma", v)} hint="0 traces the exact sub-pixel coverage contour. Any blur rounds corners and thins hairlines." />
+            <Slider label="Thin-stroke correction" value={opts.thin ?? 1} min={0} max={1.5} step={0.05} fmt={(v) => Math.round(v * 100) + "%"} onChange={(v) => set("thin", v)} hint="Mass-preserving iso-level: strokes narrower than a pixel keep their true weight (small text, hairlines)." />
+            <Slider label="Anti-alias ramp pruning" value={opts.prune ?? 7} min={0} max={14} step={1} fmt={(v) => (v === 0 ? "off" : "ΔE " + v)} onChange={(v) => set("prune", v)} hint="Drops edge-blend colours so the renderer's own anti-aliasing rebuilds them – fewer layers, crisper edges." />
+            <Slider label="Seam underlap" value={opts.underlap ?? 1} min={0} max={3} step={0.5} fmt={(v) => v + " px"} onChange={(v) => set("underlap", v)} hint="Each layer slips under the ones above it, so no hairline gaps ever show through." />
             <Slider label="Corner threshold" value={opts.cornerAngle} min={25} max={100} step={1} fmt={(v) => v + "°"} onChange={(v) => set("cornerAngle", v)} hint="Sharper than this stays a hard corner (hair tips, nails, bolts)." />
             <Slider label="Despeckle" value={opts.minArea} min={0} max={30} step={1} fmt={(v) => v + " px²"} onChange={(v) => set("minArea", v)} />
             <div>
@@ -466,7 +471,7 @@ export default function App() {
                     onClick={() => set("scale", s)}
                     className={`rounded-md border py-1.5 text-xs ${opts.scale === s ? "border-fuchsia-500 bg-fuchsia-500/10 text-white" : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600"}`}
                   >
-                    {s}× {s === 2 ? "(sharper)" : "(fast)"}
+                    {s}× {s === 2 ? "(slower, not needed)" : "(recommended)"}
                   </button>
                 ))}
               </div>
@@ -476,11 +481,12 @@ export default function App() {
           <section className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-3 text-[11px] leading-relaxed text-zinc-400">
             <div className="mb-1 font-semibold text-zinc-200">What actually happens</div>
             <ol className="list-decimal space-y-0.5 pl-4">
-              <li>Bilateral denoise, then CIELAB conversion</li>
-              <li>Line-art / edge map weights the palette search</li>
-              <li>30 passes: split worst cluster → Lloyd refine</li>
-              <li>Layers stacked light → dark, so no seams or gaps</li>
-              <li>Iso-contours at 0.5px precision, corner-aware Schneider Bézier fit</li>
+              <li>Optional edge-preserving denoise, CIELAB conversion</li>
+              <li>{opts.iterations} passes: split worst cluster → Lloyd refine, then polished on every pixel</li>
+              <li>Final labels + soft coverage fields in sRGB (how renderers blend anti-aliasing)</li>
+              <li>Layers painted big → small, each slipping under the next: no seams, edges traced ~2×</li>
+              <li>Thin strokes keep their true weight via a mass-preserving iso-level</li>
+              <li>Sub-pixel iso-contours → corner-aware Schneider Bézier fit</li>
             </ol>
           </section>
         </aside>

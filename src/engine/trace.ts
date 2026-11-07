@@ -20,23 +20,25 @@ const CASES: Record<number, number[]> = {
 };
 
 /**
- * Trace the boundary of { rank >= level } and return closed polylines.
- * Thin 1px structures (line-art, lightning, text strokes) survive because the
- * blur is tiny and the contour is interpolated at sub-pixel precision.
+ * Trace the ISO=0.5 contour of a continuous field (values 0..1, >=0.5 is inside).
+ * The field covers a FW×FH window whose top-left corner sits at (ox, oy) in image space.
+ * Contours are interpolated at sub-pixel precision, so anti-aliased edges land exactly
+ * where the coverage says they should, and hairlines / corners are not eroded by a blur.
  */
-export function traceMask(
-  rank: Uint8Array,
-  W: number,
-  H: number,
-  level: number,
+export function traceField(
+  field: Float32Array,
+  FW: number,
+  FH: number,
+  ox: number,
+  oy: number,
   opts: TraceOptions
 ): Loop[] {
-  // bounding box of mask
+  const W = FW, H = FH;
   let x0 = W, y0 = H, x1 = -1, y1 = -1;
   for (let y = 0; y < H; y++) {
     const row = y * W;
     for (let x = 0; x < W; x++) {
-      if (rank[row + x] >= level) {
+      if (field[row + x] >= 0.5) {
         if (x < x0) x0 = x;
         if (x > x1) x1 = x;
         if (y < y0) y0 = y;
@@ -46,7 +48,7 @@ export function traceMask(
   }
   if (x1 < 0) return [];
 
-  const radius = Math.max(1, Math.ceil(opts.sigma * 3));
+  const radius = opts.sigma > 0.05 ? Math.max(1, Math.ceil(opts.sigma * 3)) : 0;
   const P = radius + 3;
   const PW = x1 - x0 + 1 + P * 2;
   const PH = y1 - y0 + 1 + P * 2;
@@ -59,7 +61,7 @@ export function traceMask(
     for (let gx = 0; gx < PW; gx++) {
       let xx = x0 - P + gx;
       xx = xx < 0 ? 0 : xx >= W ? W - 1 : xx;
-      f[gy * PW + gx] = rank[row + xx] >= level ? 1 : 0;
+      f[gy * PW + gx] = field[row + xx];
     }
   }
   if (opts.sigma > 0.05) f = gaussBlur(f, PW, PH, opts.sigma);
@@ -72,6 +74,8 @@ export function traceMask(
     f[gy * PW] = 0;
     f[gy * PW + PW - 1] = 0;
   }
+  const OX = ox;
+  const OY = oy;
 
   const next = new Int32Array(PW * PH * 2).fill(-1);
   const starts: number[] = [];
@@ -106,16 +110,16 @@ export function traceMask(
   const px = (key: number): number => {
     const idx = key >> 1;
     const gx = idx % PW;
-    if (key & 1) return gx + 0.5 + x0 - P;
+    if (key & 1) return gx + 0.5 + x0 - P + OX;
     const v0 = f[idx], v1 = f[idx + 1];
-    return gx + (ISO - v0) / (v1 - v0) + 0.5 + x0 - P;
+    return gx + (ISO - v0) / (v1 - v0) + 0.5 + x0 - P + OX;
   };
   const py = (key: number): number => {
     const idx = key >> 1;
     const gy = (idx / PW) | 0;
-    if (!(key & 1)) return gy + 0.5 + y0 - P;
+    if (!(key & 1)) return gy + 0.5 + y0 - P + OY;
     const v0 = f[idx], v1 = f[idx + PW];
-    return gy + (ISO - v0) / (v1 - v0) + 0.5 + y0 - P;
+    return gy + (ISO - v0) / (v1 - v0) + 0.5 + y0 - P + OY;
   };
 
   const loops: Loop[] = [];

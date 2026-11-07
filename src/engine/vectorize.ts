@@ -1,5 +1,5 @@
 import { bilateral, gaussBlur, hex, rgbToLab } from "./color";
-import { fitLoop, loopToPath, traceMask } from "./trace";
+import { fitLoop, loopToPath, traceField } from "./trace";
 
 export interface VectorOptions {
   maxColors: number; // palette ceiling
@@ -11,6 +11,12 @@ export interface VectorOptions {
   denoise: number; // 0-3 bilateral passes
   detail: number; // 0-1 — how hard the palette fights for thin lines / edges
   scale: number; // internal super-sampling (1 or 2)
+  underlap?: number; // px each layer slips under the layers above it (seam-free stacking)
+  order?: "area" | "light"; // paint order of the layers
+  lloyd?: number; // full-resolution palette polish passes
+  thinGate?: number; // luma contrast (0-255) below which the thin correction fades out
+  thin?: number; // 0-1 strength of the thin-stroke (mass-preserving) iso-level correction
+  prune?: number; // ΔE: drop anti-alias ramp colours that are blends of two palette colours (0 = off)
 }
 
 export interface Layer {
@@ -39,6 +45,7 @@ export interface VectorResult {
   colorHistory: number[];
   nodes: number;
   loops: number;
+  debug?: { labels: Uint16Array; colors: string[]; W: number; H: number };
 }
 
 const tick = () => new Promise<void>((r) => setTimeout(r, 0));
@@ -273,28 +280,132 @@ export async function vectorize(
     await tick();
   }
 
-  /* ---------- 4. label the whole image ---------- */
+  /* ---------- 4. full-resolution classification (hard label + soft distances) ---------- */
   onProgress({ phase: "Classifying every pixel", pct: 41 });
   await tick();
   let K = centers.length / 3;
   let labels = new Uint16Array(N);
+  const d1 = new Float32Array(N); // distance to nearest centre
+  const d2 = new Float32Array(N); // distance to second-nearest centre
   const classify = () => {
     K = centers.length / 3;
-    const counts = new Float64Array(K);
+    const cnt = new Float64Array(K);
+    const sm = new Float64Array(K * 3);
     for (let i = 0; i < N; i++) {
       const l = lab[i * 3], a = lab[i * 3 + 1], b = lab[i * 3 + 2];
-      let best = 0, bd = Infinity;
+      let best = 0, bd = Infinity, sd = Infinity;
       for (let k = 0; k < K; k++) {
         const dl = l - centers[k * 3], da = a - centers[k * 3 + 1], db = b - centers[k * 3 + 2];
         const d = dl * dl + da * da + db * db;
-        if (d < bd) { bd = d; best = k; }
+        if (d < bd) { sd = bd; bd = d; best = k; }
+        else if (d < sd) sd = d;
       }
       labels[i] = best;
-      counts[best]++;
+      d1[i] = Math.sqrt(bd);
+      d2[i] = sd === Infinity ? 1e4 : Math.sqrt(sd);
+      cnt[best]++;
+      sm[best * 3] += l; sm[best * 3 + 1] += a; sm[best * 3 + 2] += b;
     }
-    return counts;
+    return { cnt, sm };
   };
-  let counts = classify();
+  let st4 = classify();
+
+  // "core" pixel = all four neighbours share its label → untouched by anti-aliasing / edges
+  const core = new Uint8Array(N);
+  const computeCore = () => {
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x, l = labels[i];
+        core[i] =
+          (x === 0 || labels[i - 1] === l) && (x === W - 1 || labels[i + 1] === l) &&
+          (y === 0 || labels[i - W] === l) && (y === H - 1 || labels[i + W] === l)
+            ? 1 : 0;
+      }
+    }
+  };
+  // move every centre to the mean of its *core* pixels (fallback: all pixels)
+  const recenter = () => {
+    computeCore();
+    const kk = centers.length / 3;
+    const cs = new Float64Array(kk * 3), cc = new Float64Array(kk);
+    for (let i = 0; i < N; i++) {
+      if (!core[i]) continue;
+      const k = labels[i];
+      cs[k * 3] += lab[i * 3]; cs[k * 3 + 1] += lab[i * 3 + 1]; cs[k * 3 + 2] += lab[i * 3 + 2]; cc[k]++;
+    }
+    for (let k = 0; k < kk; k++) {
+      if (cc[k] > 0) {
+        centers[k * 3] = cs[k * 3] / cc[k]; centers[k * 3 + 1] = cs[k * 3 + 1] / cc[k]; centers[k * 3 + 2] = cs[k * 3 + 2] / cc[k];
+      } else if (st4.cnt[k] > 0) {
+        centers[k * 3] = st4.sm[k * 3] / st4.cnt[k]; centers[k * 3 + 1] = st4.sm[k * 3 + 1] / st4.cnt[k]; centers[k * 3 + 2] = st4.sm[k * 3 + 2] / st4.cnt[k];
+      }
+    }
+  };
+  const polish = opts.lloyd ?? 2;
+  for (let p = 0; p < polish; p++) {
+    recenter();
+    st4 = classify();
+    await tick();
+    check();
+  }
+
+  /* ramp pruning: anti-alias pixels are blends of two real colours → let the renderer's
+     own anti-aliasing recreate them from a sub-pixel-accurate contour instead */
+  const pruneTol = opts.prune ?? 7;
+  if (pruneTol > 0) {
+    for (let round = 0; round < 2; round++) {
+      const kk = centers.length / 3;
+      if (kk <= 3) break;
+      const area = new Float64Array(kk), ramp = new Float64Array(kk);
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const i = y * W + x, l = labels[i];
+          area[l]++;
+          if (core[i]) continue;
+          let r = false;
+          if (x > 0 && x < W - 1) { const a = labels[i - 1], b = labels[i + 1]; if (a !== l && b !== l && a !== b) r = true; }
+          if (!r && y > 0 && y < H - 1) { const a = labels[i - W], b = labels[i + W]; if (a !== l && b !== l && a !== b) r = true; }
+          if (r) ramp[l]++;
+        }
+      }
+      const cand = Array.from({ length: kk }, (_, k) => k)
+        .filter((k) => area[k] > 0 && ramp[k] / area[k] > 0.4)
+        .sort((a, b) => ramp[b] / area[b] - ramp[a] / area[a]);
+      const gone = new Uint8Array(kk);
+      let alive = kk, dropped = 0;
+      for (const c of cand) {
+        if (alive <= 3) break;
+        const pl = centers[c * 3], pa = centers[c * 3 + 1], pb = centers[c * 3 + 2];
+        let ok = false;
+        for (let i = 0; i < kk && !ok; i++) {
+          if (i === c || gone[i]) continue;
+          for (let j = i + 1; j < kk; j++) {
+            if (j === c || gone[j]) continue;
+            const ex = centers[j * 3] - centers[i * 3], ey = centers[j * 3 + 1] - centers[i * 3 + 1], ez = centers[j * 3 + 2] - centers[i * 3 + 2];
+            const L2 = ex * ex + ey * ey + ez * ez;
+            if (L2 < 1) continue;
+            const t = ((pl - centers[i * 3]) * ex + (pa - centers[i * 3 + 1]) * ey + (pb - centers[i * 3 + 2]) * ez) / L2;
+            if (t < 0.04 || t > 0.96) continue;
+            const dl = pl - (centers[i * 3] + t * ex), da = pa - (centers[i * 3 + 1] + t * ey), db = pb - (centers[i * 3 + 2] + t * ez);
+            const dist = Math.sqrt(dl * dl + da * da + db * db);
+            if (dist <= pruneTol && dist <= 0.2 * Math.sqrt(L2)) { ok = true; break; }
+          }
+        }
+        if (ok) { gone[c] = 1; alive--; dropped++; }
+      }
+      if (!dropped) break;
+      const nc: number[] = [];
+      for (let k = 0; k < kk; k++) if (!gone[k]) nc.push(centers[k * 3], centers[k * 3 + 1], centers[k * 3 + 2]);
+      centers.length = 0;
+      centers.push(...nc);
+      st4 = classify();
+      for (let p = 0; p < 2; p++) { recenter(); st4 = classify(); }
+      await tick();
+      check();
+    }
+  }
+  computeCore();
+  let counts = st4.cnt;
   const minCount = Math.max(3, N * 0.000004);
   const keep: number[] = [];
   for (let k = 0; k < K; k++) if (counts[k] >= minCount) keep.push(k);
@@ -303,40 +414,212 @@ export async function vectorize(
     for (const k of keep) nc.push(centers[k * 3], centers[k * 3 + 1], centers[k * 3 + 2]);
     centers.length = 0;
     centers.push(...nc);
-    labels = new Uint16Array(N);
-    counts = classify();
+    st4 = classify();
+    counts = st4.cnt;
+    computeCore();
   }
   K = centers.length / 3;
 
-  // real fill colours = mean sRGB of members
-  const sr = new Float64Array(K), sg = new Float64Array(K), sb = new Float64Array(K), cn = new Float64Array(K);
+  /* ---------- sRGB stage: the renderer blends anti-aliased edges linearly in sRGB, so the
+     final labels and the soft coverage fields are computed in sRGB (exact for 2-colour edges) ---------- */
+  const rgbc = new Float64Array(K * 3);
+  {
+    const cs = new Float64Array(K * 3), cc = new Float64Array(K), ca = new Float64Array(K * 3), cA = new Float64Array(K);
+    for (let i = 0; i < N; i++) {
+      const k = labels[i];
+      for (let c = 0; c < 3; c++) ca[k * 3 + c] += px[i * 4 + c];
+      cA[k]++;
+      if (core[i]) { for (let c = 0; c < 3; c++) cs[k * 3 + c] += px[i * 4 + c]; cc[k]++; }
+    }
+    for (let k = 0; k < K; k++)
+      for (let c = 0; c < 3; c++) rgbc[k * 3 + c] = cc[k] > 0 ? cs[k * 3 + c] / cc[k] : ca[k * 3 + c] / (cA[k] || 1);
+  }
+  const classifyRGB = () => {
+    const cnt = new Float64Array(K);
+    for (let i = 0; i < N; i++) {
+      const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
+      let best = 0, bd = Infinity, sd = Infinity;
+      for (let k = 0; k < K; k++) {
+        const dr = r - rgbc[k * 3], dg = g - rgbc[k * 3 + 1], db = b - rgbc[k * 3 + 2];
+        const d = dr * dr + dg * dg + db * db;
+        if (d < bd) { sd = bd; bd = d; best = k; }
+        else if (d < sd) sd = d;
+      }
+      labels[i] = best;
+      d1[i] = Math.sqrt(bd);
+      d2[i] = sd === Infinity ? 1e4 : Math.sqrt(sd);
+      cnt[best]++;
+    }
+    return cnt;
+  };
+  counts = classifyRGB();
+  for (let p = 0; p < 2; p++) {
+    computeCore();
+    const cs = new Float64Array(K * 3), cc = new Float64Array(K);
+    for (let i = 0; i < N; i++) {
+      if (!core[i]) continue;
+      const k = labels[i];
+      for (let c = 0; c < 3; c++) cs[k * 3 + c] += px[i * 4 + c];
+      cc[k]++;
+    }
+    for (let k = 0; k < K; k++) if (cc[k] > 0) for (let c = 0; c < 3; c++) rgbc[k * 3 + c] = cs[k * 3 + c] / cc[k];
+    counts = classifyRGB();
+  }
+  const bx0 = new Int32Array(K).fill(W), by0 = new Int32Array(K).fill(H);
+  const bx1 = new Int32Array(K).fill(-1), by1 = new Int32Array(K).fill(-1);
   for (let i = 0; i < N; i++) {
     const k = labels[i];
-    sr[k] += px[i * 4]; sg[k] += px[i * 4 + 1]; sb[k] += px[i * 4 + 2]; cn[k]++;
+    const x = i % W, y = (i / W) | 0;
+    if (x < bx0[k]) bx0[k] = x;
+    if (x > bx1[k]) bx1[k] = x;
+    if (y < by0[k]) by0[k] = y;
+    if (y > by1[k]) by1[k] = y;
   }
   const colors: string[] = [];
-  for (let k = 0; k < K; k++) colors.push(hex(sr[k] / (cn[k] || 1), sg[k] / (cn[k] || 1), sb[k] / (cn[k] || 1)));
+  for (let k = 0; k < K; k++) colors.push(hex(rgbc[k * 3], rgbc[k * 3 + 1], rgbc[k * 3 + 2]));
 
-  // stack order: lightest at the bottom → darkest (line-art) on top. Seamless, gap-free.
-  const order = Array.from({ length: K }, (_, k) => k).sort((a, b) => centers[b * 3] - centers[a * 3]);
+  // paint order: biggest (background) first so small detail ends up on top
+  const mode = opts.order ?? "area";
+  const order = Array.from({ length: K }, (_, k) => k).sort((a, b) =>
+    mode === "light" ? rgbc[b * 3] * 0.3 + rgbc[b * 3 + 1] * 0.59 + rgbc[b * 3 + 2] * 0.11 - (rgbc[a * 3] * 0.3 + rgbc[a * 3 + 1] * 0.59 + rgbc[a * 3 + 2] * 0.11) : counts[b] - counts[a]
+  );
   const rankOf = new Uint8Array(K);
   order.forEach((k, r) => (rankOf[k] = r));
   const rank = new Uint8Array(N);
   for (let i = 0; i < N; i++) rank[i] = rankOf[labels[i]];
 
-  /* ---------- 5. trace + fit every layer ---------- */
+  /* ---------- 5. trace every layer on its own soft membership field ---------- */
   const layers: Layer[] = [];
   let totalNodes = 0, totalLoops = 0;
   const minArea = Math.max(0, opts.minArea * scale * scale);
+  const U = Math.max(0, Math.ceil((opts.underlap ?? 2) * scale));
+  const UVAL = opts.sigma > 0.05 ? 0.8 : 0.5001;
+  const M = U + 2;
   for (let r = 1; r < K; r++) {
     check();
     const k = order[r];
-    onProgress({
-      phase: `Tracing layer ${r}/${K - 1} · ${colors[k]}`,
-      pct: 42 + (r / K) * 56,
-    });
+    onProgress({ phase: `Tracing layer ${r}/${K - 1} · ${colors[k]}`, pct: 42 + (r / K) * 56 });
     await tick();
-    const loops = traceMask(rank, W, H, r, { sigma: Math.max(0.35, opts.sigma * scale), minArea });
+    if (bx1[k] < 0) continue;
+    const wx0 = Math.max(0, bx0[k] - M), wy0 = Math.max(0, by0[k] - M);
+    const wx1 = Math.min(W - 1, bx1[k] + M), wy1 = Math.min(H - 1, by1[k] + M);
+    const FW = wx1 - wx0 + 1, FH = wy1 - wy0 + 1;
+    const F = new Float32Array(FW * FH);
+    const mask = new Uint8Array(FW * FH); // 1 own · 2 underlap · 3 filled hole
+    const c0 = rgbc[k * 3], c1 = rgbc[k * 3 + 1], c2 = rgbc[k * 3 + 2];
+    for (let y = 0; y < FH; y++) {
+      let gi = (wy0 + y) * W + wx0;
+      let fi = y * FW;
+      for (let x = 0; x < FW; x++, gi++, fi++) {
+        const dl = px[gi * 4] - c0, da = px[gi * 4 + 1] - c1, db = px[gi * 4 + 2] - c2;
+        const dk = Math.sqrt(dl * dl + da * da + db * db);
+        const own = rank[gi] === r;
+        const dO = own ? d2[gi] : d1[gi];
+        const sum = dO + dk;
+        F[fi] = sum < 1e-6 ? (own ? 1 : 0) : dO / sum;
+        if (own) mask[fi] = 1;
+      }
+    }
+    // thin-feature correction: a stroke narrower than a pixel never reaches coverage 1, so the
+    // 0.5 iso-line would under-fill it. Lower/raise the level so the enclosed area matches the
+    // coverage mass (thin line: P/(1+P), thin gap: 1/(2-Q)); identical to 0.5 on step edges.
+    const thinK = opts.thin ?? 1;
+    if (thinK > 0) {
+      const mx = new Float32Array(FW * FH), mn = new Float32Array(FW * FH);
+      const tmx = new Float32Array(FW * FH), tmn = new Float32Array(FW * FH);
+      for (let y = 0; y < FH; y++)
+        for (let x = 0; x < FW; x++) {
+          const i = y * FW + x;
+          const a = F[x > 0 ? i - 1 : i], b = F[i], c = F[x < FW - 1 ? i + 1 : i];
+          tmx[i] = Math.max(a, b, c); tmn[i] = Math.min(a, b, c);
+        }
+      for (let y = 0; y < FH; y++)
+        for (let x = 0; x < FW; x++) {
+          const i = y * FW + x;
+          const a = y > 0 ? i - FW : i, c = y < FH - 1 ? i + FW : i;
+          mx[i] = Math.max(tmx[a], tmx[i], tmx[c]); mn[i] = Math.min(tmn[a], tmn[i], tmn[c]);
+        }
+      // local contrast (3×3 luma range) – gradients / noise must not trigger the correction
+      const lu = new Float32Array(FW * FH);
+      for (let y = 0; y < FH; y++) {
+        let gi = (wy0 + y) * W + wx0;
+        for (let x = 0; x < FW; x++, gi++) lu[y * FW + x] = px[gi * 4] * 0.3 + px[gi * 4 + 1] * 0.59 + px[gi * 4 + 2] * 0.11;
+      }
+      for (let y = 0; y < FH; y++)
+        for (let x = 0; x < FW; x++) {
+          const i = y * FW + x;
+          const a = lu[x > 0 ? i - 1 : i], b = lu[i], c = lu[x < FW - 1 ? i + 1 : i];
+          tmx[i] = Math.max(a, b, c); tmn[i] = Math.min(a, b, c);
+        }
+      const rng = new Float32Array(FW * FH);
+      for (let y = 0; y < FH; y++)
+        for (let x = 0; x < FW; x++) {
+          const i = y * FW + x;
+          const a = y > 0 ? i - FW : i, c = y < FH - 1 ? i + FW : i;
+          rng[i] = Math.max(tmx[a], tmx[i], tmx[c]) - Math.min(tmn[a], tmn[i], tmn[c]);
+        }
+      const gLo = opts.thinGate ?? 24;
+      for (let i = 0; i < F.length; i++) {
+        const P = Math.max(0.3, mx[i]), Q = Math.min(0.7, mn[i]);
+        let L = P / (1 + P) + 1 / (2 - Q) - 0.5;
+        const gate = Math.max(0, Math.min(1, (rng[i] - gLo) / gLo));
+        L = 0.5 + (L - 0.5) * thinK * gate;
+        const m = F[i];
+        F[i] = m <= L ? (m * 0.5) / L : 0.5 + ((m - L) * 0.5) / (1 - L);
+      }
+    }
+    // underlap: grow under the layers painted later (breadth-first, U steps)
+    if (U > 0) {
+      let front: number[] = [];
+      for (let i = 0; i < mask.length; i++) if (mask[i] === 1) front.push(i);
+      for (let s = 0; s < U && front.length; s++) {
+        const nxt: number[] = [];
+        for (const i of front) {
+          const x = i % FW, y = (i / FW) | 0;
+          for (let dy = -1; dy <= 1; dy++) {
+            const yy = y + dy;
+            if (yy < 0 || yy >= FH) continue;
+            for (let dx = -1; dx <= 1; dx++) {
+              const xx = x + dx;
+              if (xx < 0 || xx >= FW) continue;
+              const j = yy * FW + xx;
+              if (mask[j] === 0 && rank[(wy0 + yy) * W + wx0 + xx] > r) {
+                mask[j] = 2;
+                nxt.push(j);
+              }
+            }
+          }
+        }
+        front = nxt;
+      }
+    }
+    // fill holes made only of later-painted pixels (they are covered anyway) → far fewer nodes
+    {
+      const reach = new Uint8Array(FW * FH);
+      const q = new Int32Array(FW * FH);
+      let qh = 0, qt = 0;
+      const seed = (j: number) => {
+        if (mask[j] === 0 && !reach[j]) { reach[j] = 1; q[qt++] = j; }
+      };
+      for (let x = 0; x < FW; x++) { seed(x); seed((FH - 1) * FW + x); }
+      for (let y = 0; y < FH; y++) { seed(y * FW); seed(y * FW + FW - 1); }
+      for (let y = 0; y < FH; y++) {
+        const g = (wy0 + y) * W + wx0;
+        for (let x = 0; x < FW; x++) if (rank[g + x] < r) seed(y * FW + x);
+      }
+      while (qh < qt) {
+        const i = q[qh++];
+        const x = i % FW;
+        if (x > 0) seed(i - 1);
+        if (x < FW - 1) seed(i + 1);
+        if (i >= FW) seed(i - FW);
+        if (i < FW * (FH - 1)) seed(i + FW);
+      }
+      for (let i = 0; i < mask.length; i++) if (mask[i] === 0 && !reach[i]) mask[i] = 3;
+    }
+    for (let i = 0; i < mask.length; i++) if (mask[i] >= 2 && F[i] < UVAL) F[i] = UVAL;
+
+    const loops = traceField(F, FW, FH, wx0, wy0, { sigma: opts.sigma > 0.05 ? opts.sigma * scale : 0, minArea });
     if (!loops.length) continue;
     let d = "";
     let nodes = 0;
@@ -346,14 +629,13 @@ export async function vectorize(
       d += p.d;
       nodes += p.nodes;
     }
-    const cov = counts[k] / N;
     layers.push({
       id: `layer-${String(r).padStart(2, "0")}`,
       color: colors[k],
       d,
       nodes,
       loops: loops.length,
-      coverage: cov,
+      coverage: counts[k] / N,
     });
     totalNodes += nodes;
     totalLoops += loops.length;
@@ -370,5 +652,6 @@ export async function vectorize(
     colorHistory,
     nodes: totalNodes,
     loops: totalLoops,
+    debug: (opts as any).debug ? { labels, colors, W, H } : undefined,
   };
 }
