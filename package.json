@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "clsx": "2.1.1",
+    "lucide-react": "^1.70.0",
     "react": "19.2.6",
     "react-dom": "19.2.6",
     "tailwind-merge": "3.4.0"
@@ -24,6 +25,7 @@
     "@vitejs/plugin-react": "5.1.1",
     "jpeg-js": "^0.4.4",
     "pngjs": "^7.0.0",
+    "sharp": "^0.35.5",
     "tailwindcss": "4.1.17",
     "tsx": "^4.23.15",
     "typescript": "5.9.3",

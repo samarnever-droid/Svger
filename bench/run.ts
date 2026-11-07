@@ -109,17 +109,19 @@ export function resize(img: Img, w: number, h: number): Img {
 
 const isMain = process.argv[1]?.endsWith("run.ts");
 if (isMain) {
-  const [file, ...rest] = process.argv.slice(2);
-  const opts: any = { ...BASE };
-  let save: string | undefined;
-  let cropArg: number[] | undefined;
-  for (const kv of rest) {
-    if (kv.startsWith("--save=")) save = kv.slice(7);
-    else if (kv.startsWith("--crop=")) cropArg = kv.slice(7).split(",").map(Number);
-    else { const [k, v] = kv.split("="); opts[k] = Number(v); }
-  }
-  let img = loadImg(file);
-  if (cropArg) img = crop(img, cropArg[0], cropArg[1], cropArg[2], cropArg[3]);
-  const r = await bench(img, opts, save);
-  console.log(JSON.stringify(Object.fromEntries(Object.entries(r).map(([k, v]) => [k, +v.toFixed(3)]))));
+  (async () => {
+    const [file, ...rest] = process.argv.slice(2);
+    const opts: any = { ...BASE };
+    let save: string | undefined;
+    let cropArg: number[] | undefined;
+    for (const kv of rest) {
+      if (kv.startsWith("--save=")) save = kv.slice(7);
+      else if (kv.startsWith("--crop=")) cropArg = kv.slice(7).split(",").map(Number);
+      else { const [k, v] = kv.split("="); opts[k] = Number(v); }
+    }
+    let img = loadImg(file);
+    if (cropArg) img = crop(img, cropArg[0], cropArg[1], cropArg[2], cropArg[3]);
+    const r = await bench(img, opts, save);
+    console.log(JSON.stringify(Object.fromEntries(Object.entries(r).map(([k, v]) => [k, +v.toFixed(3)]))));
+  })();
 }

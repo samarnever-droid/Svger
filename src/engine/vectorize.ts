@@ -1,9 +1,23 @@
-import { bilateral, gaussBlur, hex, rgbToLab } from "./color";
-import { fitLoop, loopToPath, traceField } from "./trace";
+import { bilateral, gaussBlur, hex, regularizeLabels, rgbToPerceptualLab } from "./color";
+import { detectPrimitiveShape, fitLoop, loopToPath, traceField, type ShapePrimitive } from "./trace";
+import {
+  fitRegionShading,
+  segmentLayerRegions,
+  type GradientDef,
+} from "./gradients";
+import {
+  computeImageGradient,
+  evalShadingAtPixel,
+  mergeFalseHighlightSpots,
+  synthesizeLightingGlowLayers,
+  synthesizeResidualDetailLayers,
+  type FilterDef,
+  type ClipPathDef,
+} from "./lighting";
 
 export interface VectorOptions {
   maxColors: number; // palette ceiling
-  iterations: number; // refinement passes (default 30)
+  iterations: number; // refinement passes (default 30-100)
   tolerance: number; // Bézier fit tolerance in source px
   sigma: number; // contour smoothing (source px)
   cornerAngle: number; // degrees
@@ -17,15 +31,38 @@ export interface VectorOptions {
   thinGate?: number; // luma contrast (0-255) below which the thin correction fades out
   thin?: number; // 0-1 strength of the thin-stroke (mass-preserving) iso-level correction
   prune?: number; // ΔE: drop anti-alias ramp colours that are blends of two palette colours (0 = off)
+  gradients?: boolean; // Enable per-region <linearGradient> & <radialGradient> fitting
+  antiSpot?: number; // 0-1.5 Anti-white-spot & lighting glow synthesis strength
+  primitives?: boolean; // Enable <rect>, <circle>, <ellipse>, <polygon> primitive emission
+  residualPass?: boolean; // Enable residual error-driven micro-detail & catchlight pass
+}
+
+export interface SubShape {
+  kind: "path" | "rect" | "circle" | "ellipse" | "polygon" | "polyline" | "line";
+  fill: string;
+  colorHex: string;
+  d?: string;
+  primitive?: ShapePrimitive;
+  opacity?: number;
+  filterId?: string;
+  clipPathId?: string;
+  nodes: number;
+  loops: number;
 }
 
 export interface Layer {
   id: string;
   color: string;
+  fill?: string;
   d: string;
+  subShapes?: SubShape[];
+  filterId?: string;
+  clipPathId?: string;
+  opacity?: number;
   nodes: number;
   loops: number;
   coverage: number;
+  kind?: "base" | "gradient" | "lighting" | "residual";
 }
 
 export interface Progress {
@@ -40,11 +77,17 @@ export interface VectorResult {
   width: number;
   height: number;
   background: string;
+  backgroundFill?: string;
   layers: Layer[];
+  gradients?: GradientDef[];
+  filters?: FilterDef[];
+  clipPaths?: ClipPathDef[];
   errors: number[];
   colorHistory: number[];
   nodes: number;
   loops: number;
+  tagCounts?: Record<string, number>;
+  regionalColorAccuracy?: number;
   debug?: { labels: Uint16Array; colors: string[]; W: number; H: number };
 }
 
@@ -60,13 +103,123 @@ function rng(seed: number) {
   };
 }
 
-export function buildSvg(w: number, h: number, bg: string, layers: Layer[], hidden?: Set<string>): string {
+function renderSubShapeTag(sh: SubShape): string {
+  const opAttr = sh.opacity !== undefined && sh.opacity < 0.995 ? ` fill-opacity="${sh.opacity}"` : "";
+  const fltAttr = sh.filterId ? ` filter="url(#${sh.filterId})"` : "";
+  const clipAttr = sh.clipPathId ? ` clip-path="url(#${sh.clipPathId})"` : "";
+  if (sh.kind !== "path" && sh.primitive) {
+    const p = sh.primitive;
+    const attrStr = Object.entries(p.attrs)
+      .map(([k, v]) => `${k}="${v}"`)
+      .join(" ");
+    return `<${p.tag} fill="${sh.fill}"${opAttr}${fltAttr}${clipAttr} ${attrStr}/>`;
+  }
+  return `<path fill="${sh.fill}" fill-rule="evenodd"${opAttr}${fltAttr}${clipAttr} d="${sh.d || ""}"/>`;
+}
+
+export function countSvgTagsFast(svg: string): Record<string, number> {
+  const tags = [
+    "svg", "defs", "linearGradient", "radialGradient", "stop",
+    "filter", "feGaussianBlur", "feMerge", "clipPath",
+    "g", "rect", "circle", "ellipse", "polygon", "path"
+  ];
+  const counts: Record<string, number> = {};
+  for (const t of tags) {
+    const pat = `<${t}`;
+    let pos = 0, c = 0;
+    while ((pos = svg.indexOf(pat, pos)) !== -1) {
+      const nextChar = svg.charCodeAt(pos + pat.length);
+      if (nextChar === 32 || nextChar === 62 || nextChar === 47 || nextChar === 10) c++;
+      pos += pat.length;
+    }
+    if (c > 0) counts[t] = c;
+  }
+  return counts;
+}
+
+export function buildSvg(
+  w: number,
+  h: number,
+  bg: string,
+  layers: Layer[],
+  hidden?: Set<string>,
+  resultMeta?: Pick<VectorResult, "backgroundFill" | "gradients" | "filters" | "clipPaths">
+): string {
+  const grads = resultMeta?.gradients ?? [];
+  const filters = resultMeta?.filters ?? [];
+  const clips = resultMeta?.clipPaths ?? [];
+  const bgFill = resultMeta?.backgroundFill ?? bg;
+
   let s = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" shape-rendering="geometricPrecision">`;
-  s += `<title>Vectorised artwork</title>`;
-  s += `<rect id="background" width="${w}" height="${h}" fill="${bg}"/>`;
+  s += `<title>SVGer Hybrid Vector Artwork</title>`;
+  s += `<desc>Pure vector geometry with adaptive regional gradients, anti-spot lighting filters, and sub-pixel Bézier contours</desc>`;
+
+  if (grads.length > 0 || filters.length > 0 || clips.length > 0) {
+    s += `<defs>`;
+    for (const f of filters) {
+      s += `<filter id="${f.id}" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">`;
+      s += `<feGaussianBlur in="SourceGraphic" stdDeviation="${f.stdDeviation}" result="blur"/>`;
+      s += `<feMerge><feMergeNode in="blur"/></feMerge>`;
+      s += `</filter>`;
+    }
+    for (const cp of clips) {
+      s += `<clipPath id="${cp.id}"><path d="${cp.d}" fill-rule="evenodd"/></clipPath>`;
+    }
+    for (const g of grads) {
+      if (g.type === "linear") {
+        s += `<linearGradient id="${g.id}" x1="${g.x1}" y1="${g.y1}" x2="${g.x2}" y2="${g.y2}" gradientUnits="userSpaceOnUse">`;
+        for (const st of g.stops) {
+          const op = st.opacity !== undefined && st.opacity < 1 ? ` stop-opacity="${st.opacity}"` : "";
+          s += `<stop offset="${st.offset}" stop-color="${st.color}"${op}/>`;
+        }
+        s += `</linearGradient>`;
+      } else {
+        const units = g.units ?? "userSpaceOnUse";
+        const fxAttr = g.fx !== g.cx || g.fy !== g.cy ? ` fx="${g.fx}" fy="${g.fy}"` : "";
+        s += `<radialGradient id="${g.id}" cx="${g.cx}" cy="${g.cy}" r="${g.r}"${fxAttr} gradientUnits="${units}">`;
+        for (const st of g.stops) {
+          const op = st.opacity !== undefined ? ` stop-opacity="${st.opacity}"` : "";
+          s += `<stop offset="${st.offset}" stop-color="${st.color}"${op}/>`;
+        }
+        s += `</radialGradient>`;
+      }
+    }
+    s += `</defs>`;
+  }
+
+  s += `<rect id="background" width="${w}" height="${h}" fill="${bgFill}"/>`;
+
   for (const l of layers) {
     if (hidden && hidden.has(l.id)) continue;
-    s += `<path id="${l.id}" fill="${l.color}" fill-rule="evenodd" d="${l.d}"/>`;
+    if (l.subShapes && l.subShapes.length > 0) {
+      if (l.subShapes.length === 1) {
+        const sh = l.subShapes[0];
+        const opAttr = sh.opacity !== undefined && sh.opacity < 0.995 ? ` fill-opacity="${sh.opacity}"` : "";
+        const fltAttr = sh.filterId ? ` filter="url(#${sh.filterId})"` : "";
+        const clipAttr = sh.clipPathId ? ` clip-path="url(#${sh.clipPathId})"` : "";
+        if (sh.kind !== "path" && sh.primitive) {
+          const p = sh.primitive;
+          const attrStr = Object.entries(p.attrs)
+            .map(([k, v]) => `${k}="${v}"`)
+            .join(" ");
+          s += `<${p.tag} id="${l.id}" fill="${sh.fill}"${opAttr}${fltAttr}${clipAttr} ${attrStr}/>`;
+        } else {
+          s += `<path id="${l.id}" fill="${sh.fill}" fill-rule="evenodd"${opAttr}${fltAttr}${clipAttr} d="${sh.d || l.d}"/>`;
+        }
+      } else {
+        const fltAttr = l.filterId ? ` filter="url(#${l.filterId})"` : "";
+        s += `<g id="${l.id}"${fltAttr}>`;
+        for (const sh of l.subShapes) {
+          s += renderSubShapeTag(sh);
+        }
+        s += `</g>`;
+      }
+    } else if (l.d) {
+      const fill = l.fill ?? l.color;
+      const fltAttr = l.filterId ? ` filter="url(#${l.filterId})"` : "";
+      const opAttr = l.opacity !== undefined && l.opacity < 0.995 ? ` fill-opacity="${l.opacity}"` : "";
+      s += `<path id="${l.id}" fill="${fill}" fill-rule="evenodd"${opAttr}${fltAttr} d="${l.d}"/>`;
+    }
   }
   return s + "</svg>";
 }
@@ -84,6 +237,10 @@ export async function vectorize(
   };
   const W = img.width, H = img.height, N = W * H;
   const scale = opts.scale;
+  const enableGradients = opts.gradients ?? true;
+  const antiSpotStrength = opts.antiSpot ?? 1.0;
+  const enablePrimitives = opts.primitives ?? true;
+  const enableResidual = opts.residualPass ?? true;
 
   /* ---------- 1. denoise ---------- */
   onProgress({ phase: "Denoising (edge-preserving)", pct: 1 });
@@ -97,18 +254,19 @@ export async function vectorize(
     check();
   }
 
-  /* ---------- 2. Lab + detail weights ---------- */
-  onProgress({ phase: "Converting to CIELAB, mapping line-art & edges", pct: 7 });
+  /* ---------- 2. Perceptual Oklab+CIELAB + detail & lighting ramp weights ---------- */
+  onProgress({ phase: "Converting to Oklab+CIELAB & mapping lighting ramps", pct: 7 });
   await tick();
   const lab = new Float32Array(N * 3);
   const Lc = new Float32Array(N);
   for (let i = 0; i < N; i++) {
-    rgbToLab(px[i * 4], px[i * 4 + 1], px[i * 4 + 2], lab, i * 3);
+    rgbToPerceptualLab(px[i * 4], px[i * 4 + 1], px[i * 4 + 2], lab, i * 3);
     Lc[i] = lab[i * 3];
   }
   const blurred = gaussBlur(Lc, W, H, 2.2 * scale);
+  const gradMag = computeImageGradient(px, W, H);
 
-  const S = Math.min(N, 90000);
+  const S = Math.min(N, 95000);
   const sLab = new Float32Array(S * 3);
   const sW = new Float32Array(S);
   const sIdx = new Int32Array(S);
@@ -117,20 +275,26 @@ export async function vectorize(
   for (let j = 0; j < S; j++) {
     const i = Math.min(N - 1, Math.floor(j * step + rand() * step));
     sIdx[j] = i;
-    sLab[j * 3] = lab[i * 3];
-    sLab[j * 3 + 1] = lab[i * 3 + 1];
-    sLab[j * 3 + 2] = lab[i * 3 + 2];
+    const l = lab[i * 3], a = lab[i * 3 + 1], b = lab[i * 3 + 2];
+    sLab[j * 3] = l;
+    sLab[j * 3 + 1] = a;
+    sLab[j * 3 + 2] = b;
     const x = i % W, y = (i / W) | 0;
     const xm = x > 0 ? i - 1 : i, xp = x < W - 1 ? i + 1 : i;
     const ym = y > 0 ? i - W : i, yp = y < H - 1 ? i + W : i;
     const g = Math.abs(Lc[xp] - Lc[xm]) + Math.abs(Lc[yp] - Lc[ym]);
-    const line = Math.max(0, blurred[i] - Lc[i]); // dark thin structure
+    const line = Math.max(0, blurred[i] - l); // dark thin structure
+    const highlightPeak = Math.max(0, l - blurred[i]); // bright glint / text / catchlight
     const edge = Math.min(1, g / 18);
-    const ln = Math.min(1, line / 9);
-    sW[j] = 1 + opts.detail * (5 * ln + 2 * edge);
+    const ln = Math.min(1, (line + highlightPeak * 0.85) / 9);
+    const chroma = Math.hypot(a, b);
+    const chromaBoost = chroma > 26 ? Math.min(1.4, (chroma - 26) / 30) : 0;
+    // Smooth highlight lighting ramp weight (prevents coarse banding on cheeks/clouds/sky)
+    const smoothHighlight = l > 68 && g > 0.3 && g < 7.5 ? 0.65 * antiSpotStrength : 0;
+    sW[j] = 1 + opts.detail * (4.8 * ln + 2.0 * edge + 1.5 * chromaBoost) + smoothHighlight;
   }
 
-  /* ---------- 3. 30-pass error-driven palette refinement ---------- */
+  /* ---------- 3. Error-driven palette refinement + Anchor Pinning ---------- */
   const centers: number[] = [];
   {
     let m0 = 0, m1 = 0, m2 = 0, ws = 0;
@@ -240,7 +404,7 @@ export async function vectorize(
   for (let it = 0; it < iters; it++) {
     check();
     let K = centers.length / 3;
-    if (it < growth && K < opts.maxColors && lastErr > 0.9) {
+    if (it < growth && K < opts.maxColors && lastErr > 0.85) {
       const target = Math.min(opts.maxColors, Math.round(1 + (opts.maxColors - 1) * ((it + 1) / growth)));
       let guard = 0;
       while (K < target && guard++ < 8) {
@@ -251,14 +415,30 @@ export async function vectorize(
           if (m <= 0) break;
           if (splitCluster(c)) m--;
         }
-        // error-driven: inject the colour that is worst represented (rare highlights, tiny details)
+        // Iteration 08 & 09: Density-smoothed error injection (avoids single-pixel outlier white spots)
         if (it % 3 === 2 && centers.length / 3 < target) {
           let bj = -1, bv = 0;
           for (let j = 0; j < S; j++) {
-            const v = sDist[j] * sW[j];
+            // Avoid injecting an isolated smooth-glow pixel as a lone point center
+            const gi = sIdx[j];
+            const isSmoothSpot = sLab[j * 3] > 78 && gradMag[gi] < 5.5;
+            const v = sDist[j] * sW[j] * (isSmoothSpot ? 0.45 : 1.0);
             if (v > bv) { bv = v; bj = j; }
           }
-          if (bj >= 0 && sDist[bj] > 16) centers.push(sLab[bj * 3], sLab[bj * 3 + 1], sLab[bj * 3 + 2]);
+          if (bj >= 0 && sDist[bj] > 16) {
+            // Average all high-error samples near sLab[bj] so the new center is a true local mode
+            const bl = sLab[bj * 3], ba = sLab[bj * 3 + 1], bb = sLab[bj * 3 + 2];
+            let sl = 0, sa = 0, sb = 0, sw = 0;
+            for (let j = 0; j < S; j++) {
+              const dl = sLab[j * 3] - bl, da = sLab[j * 3 + 1] - ba, db = sLab[j * 3 + 2] - bb;
+              if (dl * dl + da * da + db * db <= 36) {
+                const w = sW[j];
+                sl += sLab[j * 3] * w; sa += sLab[j * 3 + 1] * w; sb += sLab[j * 3 + 2] * w; sw += w;
+              }
+            }
+            if (sw > 0) centers.push(sl / sw, sa / sw, sb / sw);
+            else centers.push(bl, ba, bb);
+          }
         }
         const nk = centers.length / 3;
         if (nk === K) break;
@@ -280,13 +460,31 @@ export async function vectorize(
     await tick();
   }
 
-  /* ---------- 4. full-resolution classification (hard label + soft distances) ---------- */
+  /* ---------- Iteration 08: Pure White / Black & High-Chroma Anchor Pinning ---------- */
+  {
+    assign();
+    let whiteL = 0, whiteA = 0, whiteB = 0, whiteCnt = 0, whiteErr = 0;
+    for (let j = 0; j < S; j++) {
+      const l = sLab[j * 3], a = sLab[j * 3 + 1], b = sLab[j * 3 + 2];
+      if (l > 95.5 && Math.hypot(a, b) < 8) {
+        whiteL += l; whiteA += a; whiteB += b; whiteCnt++;
+        whiteErr += Math.sqrt(sDist[j]);
+      }
+    }
+    // If crisp white pixels exist (e.g. "15th MAPPA" text) and are poorly represented, pin a white anchor
+    if (whiteCnt >= Math.max(8, S * 0.0003) && whiteErr / whiteCnt > 3.2) {
+      centers.push(whiteL / whiteCnt, whiteA / whiteCnt, whiteB / whiteCnt);
+      lloyd();
+    }
+  }
+
+  /* ---------- 4. Full-resolution classification ---------- */
   onProgress({ phase: "Classifying every pixel", pct: 41 });
   await tick();
   let K = centers.length / 3;
   let labels = new Uint16Array(N);
-  const d1 = new Float32Array(N); // distance to nearest centre
-  const d2 = new Float32Array(N); // distance to second-nearest centre
+  const d1 = new Float32Array(N);
+  const d2 = new Float32Array(N);
   const classify = () => {
     K = centers.length / 3;
     const cnt = new Float64Array(K);
@@ -310,7 +508,6 @@ export async function vectorize(
   };
   let st4 = classify();
 
-  // "core" pixel = all four neighbours share its label → untouched by anti-aliasing / edges
   const core = new Uint8Array(N);
   const computeCore = () => {
     for (let y = 0; y < H; y++) {
@@ -323,7 +520,6 @@ export async function vectorize(
       }
     }
   };
-  // move every centre to the mean of its *core* pixels (fallback: all pixels)
   const recenter = () => {
     computeCore();
     const kk = centers.length / 3;
@@ -349,9 +545,8 @@ export async function vectorize(
     check();
   }
 
-  /* ramp pruning: anti-alias pixels are blends of two real colours → let the renderer's
-     own anti-aliasing recreate them from a sub-pixel-accurate contour instead */
-  const pruneTol = opts.prune ?? 7;
+  /* ramp pruning */
+  const pruneTol = opts.prune ?? 0;
   if (pruneTol > 0) {
     for (let round = 0; round < 2; round++) {
       const kk = centers.length / 3;
@@ -420,8 +615,7 @@ export async function vectorize(
   }
   K = centers.length / 3;
 
-  /* ---------- sRGB stage: the renderer blends anti-aliased edges linearly in sRGB, so the
-     final labels and the soft coverage fields are computed in sRGB (exact for 2-colour edges) ---------- */
+  /* ---------- sRGB stage + Bilateral Label Regularization + Anti-Spot Merger ---------- */
   const rgbc = new Float64Array(K * 3);
   {
     const cs = new Float64Array(K * 3), cc = new Float64Array(K), ca = new Float64Array(K * 3), cA = new Float64Array(K);
@@ -465,10 +659,22 @@ export async function vectorize(
     for (let k = 0; k < K; k++) if (cc[k] > 0) for (let c = 0; c < 3; c++) rgbc[k * 3 + c] = cs[k * 3 + c] / cc[k];
     counts = classifyRGB();
   }
+
+  // Iteration 10: Bilateral Label Regularization (removes cross-region color bleed on lips/skin)
+  regularizeLabels(labels, px, rgbc, W, H, Math.round(12 * scale * scale), 14);
+
+  // Iteration 16: Merge false-contour highlight spots into parent smooth lighting region when gradients are enabled
+  if (enableGradients && antiSpotStrength > 0) {
+    mergeFalseHighlightSpots(labels, px, rgbc, gradMag, W, H, scale, antiSpotStrength);
+  }
+
+  // Recompute counts & bounding boxes after label regularization and spot merging
+  counts.fill(0);
   const bx0 = new Int32Array(K).fill(W), by0 = new Int32Array(K).fill(H);
   const bx1 = new Int32Array(K).fill(-1), by1 = new Int32Array(K).fill(-1);
   for (let i = 0; i < N; i++) {
     const k = labels[i];
+    counts[k]++;
     const x = i % W, y = (i / W) | 0;
     if (x < bx0[k]) bx0[k] = x;
     if (x > bx1[k]) bx1[k] = x;
@@ -478,27 +684,87 @@ export async function vectorize(
   const colors: string[] = [];
   for (let k = 0; k < K; k++) colors.push(hex(rgbc[k * 3], rgbc[k * 3 + 1], rgbc[k * 3 + 2]));
 
-  // paint order: biggest (background) first so small detail ends up on top
+  // Paint order: biggest (background) first so small detail ends up on top
   const mode = opts.order ?? "area";
   const order = Array.from({ length: K }, (_, k) => k).sort((a, b) =>
-    mode === "light" ? rgbc[b * 3] * 0.3 + rgbc[b * 3 + 1] * 0.59 + rgbc[b * 3 + 2] * 0.11 - (rgbc[a * 3] * 0.3 + rgbc[a * 3 + 1] * 0.59 + rgbc[a * 3 + 2] * 0.11) : counts[b] - counts[a]
+    mode === "light"
+      ? rgbc[b * 3] * 0.3 + rgbc[b * 3 + 1] * 0.59 + rgbc[b * 3 + 2] * 0.11 -
+        (rgbc[a * 3] * 0.3 + rgbc[a * 3 + 1] * 0.59 + rgbc[a * 3 + 2] * 0.11)
+      : counts[b] - counts[a]
   );
   const rankOf = new Uint8Array(K);
   order.forEach((k, r) => (rankOf[k] = r));
   const rank = new Uint8Array(N);
   for (let i = 0; i < N; i++) rank[i] = rankOf[labels[i]];
 
-  /* ---------- 5. trace every layer on its own soft membership field ---------- */
+  /* ---------- Fit Background Layer (rank 0) Shading & Initialize Predicted RGB Buffer ---------- */
+  const gradients: GradientDef[] = [];
+  const filters: FilterDef[] = [];
+  const clipPaths: ClipPathDef[] = [];
+  const parsedStopsCache = new Map<string, [number, number, number, number][]>();
+
+  const predR = new Float32Array(N);
+  const predG = new Float32Array(N);
+  const predB = new Float32Array(N);
+
+  const bgK = order[0];
+  let backgroundHex = colors[bgK];
+  let backgroundFill = backgroundHex;
+  {
+    const bgPix: number[] = [];
+    for (let i = 0; i < N; i++) if (rank[i] === 0) bgPix.push(i);
+    if (bgPix.length > 0) {
+      const bgFit = fitRegionShading(
+        Int32Array.from(bgPix),
+        bgPix.length,
+        null,
+        px,
+        gradMag,
+        W,
+        scale,
+        "bg",
+        enableGradients,
+        antiSpotStrength
+      );
+      backgroundHex = bgFit.colorHex;
+      backgroundFill = bgFit.fill;
+      if (bgFit.gradient) gradients.push(bgFit.gradient);
+      for (let i = 0; i < N; i++) {
+        const [pr, pg, pb] = evalShadingAtPixel(
+          i % W,
+          (i / W) | 0,
+          scale,
+          bgFit.meanR,
+          bgFit.meanG,
+          bgFit.meanB,
+          bgFit.gradient,
+          parsedStopsCache
+        );
+        predR[i] = pr;
+        predG[i] = pg;
+        predB[i] = pb;
+      }
+    } else {
+      for (let i = 0; i < N; i++) {
+        predR[i] = rgbc[bgK * 3];
+        predG[i] = rgbc[bgK * 3 + 1];
+        predB[i] = rgbc[bgK * 3 + 2];
+      }
+    }
+  }
+
+  /* ---------- 5. Trace every layer & fit per-region colors, gradients & primitives ---------- */
   const layers: Layer[] = [];
   let totalNodes = 0, totalLoops = 0;
   const minArea = Math.max(0, opts.minArea * scale * scale);
   const U = Math.max(0, Math.ceil((opts.underlap ?? 2) * scale));
   const UVAL = opts.sigma > 0.05 ? 0.8 : 0.5001;
   const M = U + 2;
+
   for (let r = 1; r < K; r++) {
     check();
     const k = order[r];
-    onProgress({ phase: `Tracing layer ${r}/${K - 1} · ${colors[k]}`, pct: 42 + (r / K) * 56 });
+    onProgress({ phase: `Tracing & shading layer ${r}/${K - 1} · ${colors[k]}`, pct: 42 + (r / K) * 48 });
     await tick();
     if (bx1[k] < 0) continue;
     const wx0 = Math.max(0, bx0[k] - M), wy0 = Math.max(0, by0[k] - M);
@@ -516,13 +782,16 @@ export async function vectorize(
         const own = rank[gi] === r;
         const dO = own ? d2[gi] : d1[gi];
         const sum = dO + dk;
-        F[fi] = sum < 1e-6 ? (own ? 1 : 0) : dO / sum;
+        let fVal = sum < 1e-6 ? (own ? 1 : 0) : dO / sum;
+        // Ensure pixels reassigned by regularizeLabels / mergeFalseHighlightSpots respect own membership
+        if (own && fVal < 0.502) fVal = 0.55;
+        else if (!own && fVal >= 0.5) fVal = 0.45;
+        F[fi] = fVal;
         if (own) mask[fi] = 1;
       }
     }
-    // thin-feature correction: a stroke narrower than a pixel never reaches coverage 1, so the
-    // 0.5 iso-line would under-fill it. Lower/raise the level so the enclosed area matches the
-    // coverage mass (thin line: P/(1+P), thin gap: 1/(2-Q)); identical to 0.5 on step edges.
+
+    // Thin-feature mass-preserving iso-level correction
     const thinK = opts.thin ?? 1;
     if (thinK > 0) {
       const mx = new Float32Array(FW * FH), mn = new Float32Array(FW * FH);
@@ -539,7 +808,6 @@ export async function vectorize(
           const a = y > 0 ? i - FW : i, c = y < FH - 1 ? i + FW : i;
           mx[i] = Math.max(tmx[a], tmx[i], tmx[c]); mn[i] = Math.min(tmn[a], tmn[i], tmn[c]);
         }
-      // local contrast (3×3 luma range) – gradients / noise must not trigger the correction
       const lu = new Float32Array(FW * FH);
       for (let y = 0; y < FH; y++) {
         let gi = (wy0 + y) * W + wx0;
@@ -551,24 +819,25 @@ export async function vectorize(
           const a = lu[x > 0 ? i - 1 : i], b = lu[i], c = lu[x < FW - 1 ? i + 1 : i];
           tmx[i] = Math.max(a, b, c); tmn[i] = Math.min(a, b, c);
         }
-      const rng = new Float32Array(FW * FH);
+      const rngArr = new Float32Array(FW * FH);
       for (let y = 0; y < FH; y++)
         for (let x = 0; x < FW; x++) {
           const i = y * FW + x;
           const a = y > 0 ? i - FW : i, c = y < FH - 1 ? i + FW : i;
-          rng[i] = Math.max(tmx[a], tmx[i], tmx[c]) - Math.min(tmn[a], tmn[i], tmn[c]);
+          rngArr[i] = Math.max(tmx[a], tmx[i], tmx[c]) - Math.min(tmn[a], tmn[i], tmn[c]);
         }
       const gLo = opts.thinGate ?? 24;
       for (let i = 0; i < F.length; i++) {
         const P = Math.max(0.3, mx[i]), Q = Math.min(0.7, mn[i]);
         let L = P / (1 + P) + 1 / (2 - Q) - 0.5;
-        const gate = Math.max(0, Math.min(1, (rng[i] - gLo) / gLo));
+        const gate = Math.max(0, Math.min(1, (rngArr[i] - gLo) / gLo));
         L = 0.5 + (L - 0.5) * thinK * gate;
         const m = F[i];
         F[i] = m <= L ? (m * 0.5) / L : 0.5 + ((m - L) * 0.5) / (1 - L);
       }
     }
-    // underlap: grow under the layers painted later (breadth-first, U steps)
+
+    // Underlap: grow under the layers painted later
     if (U > 0) {
       let front: number[] = [];
       for (let i = 0; i < mask.length; i++) if (mask[i] === 1) front.push(i);
@@ -593,7 +862,8 @@ export async function vectorize(
         front = nxt;
       }
     }
-    // fill holes made only of later-painted pixels (they are covered anyway) → far fewer nodes
+
+    // Fill holes made only of later-painted pixels
     {
       const reach = new Uint8Array(FW * FH);
       const q = new Int32Array(FW * FH);
@@ -619,39 +889,271 @@ export async function vectorize(
     }
     for (let i = 0; i < mask.length; i++) if (mask[i] >= 2 && F[i] < UVAL) F[i] = UVAL;
 
-    const loops = traceField(F, FW, FH, wx0, wy0, { sigma: opts.sigma > 0.05 ? opts.sigma * scale : 0, minArea });
+    const loops = traceField(F, FW, FH, wx0, wy0, {
+      sigma: opts.sigma > 0.05 ? opts.sigma * scale : 0,
+      minArea,
+    });
     if (!loops.length) continue;
-    let d = "";
-    let nodes = 0;
-    for (const lp of loops) {
-      const fit = fitLoop(lp, { tolerance: opts.tolerance * scale, cornerAngle: opts.cornerAngle });
-      const p = loopToPath(lp, fit.segs, fit.polygon, scale);
-      d += p.d;
-      nodes += p.nodes;
+
+    // Segment layer into connected regions so each region gets its own exact visible color or gradient
+    const regions = segmentLayerRegions(F, loops, FW, FH, wx0, wy0, W, rank, r);
+    const subShapes: SubShape[] = [];
+    // Group solid-color paths that share the exact same hex string within this layer to keep SVG compact
+    const solidPathBuckets = new Map<string, { d: string; nodes: number; loops: number }>();
+    let layerNodes = 0;
+    let layerLoops = 0;
+    let hasGradientInLayer = false;
+
+    for (let regIdx = 0; regIdx < regions.length; regIdx++) {
+      const reg = regions[regIdx];
+      const regFit = fitRegionShading(
+        reg.pixels,
+        reg.pixels.length,
+        null,
+        px,
+        gradMag,
+        W,
+        scale,
+        `r${r}-c${reg.id}`,
+        enableGradients,
+        antiSpotStrength
+      );
+
+      if (regFit.gradient) {
+        gradients.push(regFit.gradient);
+        hasGradientInLayer = true;
+      }
+
+      // Update predicted RGB buffer for all truly owned pixels in this region
+      for (let pi = 0; pi < reg.pixels.length; pi++) {
+        const gi = reg.pixels[pi];
+        if (rank[gi] !== r) continue;
+        const [pr, pg, pb] = evalShadingAtPixel(
+          gi % W,
+          (gi / W) | 0,
+          scale,
+          regFit.meanR,
+          regFit.meanG,
+          regFit.meanB,
+          regFit.gradient,
+          parsedStopsCache
+        );
+        predR[gi] = pr;
+        predG[gi] = pg;
+        predB[gi] = pb;
+      }
+
+      // Check for single-loop geometric primitive (<rect>, <circle>, <ellipse>, <polygon>)
+      if (enablePrimitives && reg.loops.length === 1 && !regFit.gradient) {
+        const lp = reg.loops[0];
+        const fit = fitLoop(lp, { tolerance: opts.tolerance * scale, cornerAngle: opts.cornerAngle });
+        const prim = detectPrimitiveShape(lp, fit.segs, scale, opts.tolerance);
+        if (prim) {
+          subShapes.push({
+            kind: prim.tag,
+            fill: regFit.fill,
+            colorHex: regFit.colorHex,
+            primitive: prim,
+            nodes: prim.nodes,
+            loops: 1,
+          });
+          layerNodes += prim.nodes;
+          layerLoops += 1;
+          continue;
+        }
+      }
+
+      let regD = "";
+      let regNodes = 0;
+      for (const lp of reg.loops) {
+        const fit = fitLoop(lp, { tolerance: opts.tolerance * scale, cornerAngle: opts.cornerAngle });
+        const p = loopToPath(lp, fit.segs, fit.polygon, scale, opts.tolerance);
+        regD += p.d;
+        regNodes += p.nodes;
+      }
+
+      layerNodes += regNodes;
+      layerLoops += reg.loops.length;
+
+      if (regFit.gradient) {
+        subShapes.push({
+          kind: "path",
+          fill: regFit.fill,
+          colorHex: regFit.colorHex,
+          d: regD,
+          nodes: regNodes,
+          loops: reg.loops.length,
+        });
+      } else {
+        // Quantize tiny speckles (< 16px) to 2-unit RGB buckets so tiny speckles merge into shared <path>
+        const fillKey =
+          reg.pixels.length < 16 * scale * scale
+            ? hex(
+                Math.round(regFit.meanR / 2) * 2,
+                Math.round(regFit.meanG / 2) * 2,
+                Math.round(regFit.meanB / 2) * 2
+              )
+            : regFit.colorHex;
+        const existing = solidPathBuckets.get(fillKey);
+        if (existing) {
+          existing.d += regD;
+          existing.nodes += regNodes;
+          existing.loops += reg.loops.length;
+        } else {
+          solidPathBuckets.set(fillKey, { d: regD, nodes: regNodes, loops: reg.loops.length });
+        }
+      }
     }
+
+    for (const [fillHex, bucket] of solidPathBuckets.entries()) {
+      subShapes.push({
+        kind: "path",
+        fill: fillHex,
+        colorHex: fillHex,
+        d: bucket.d,
+        nodes: bucket.nodes,
+        loops: bucket.loops,
+      });
+    }
+
+    if (subShapes.length === 0) continue;
+
+    // Combined fallback d for compatibility
+    const combinedD = subShapes.map((s) => s.d || "").join("");
     layers.push({
       id: `layer-${String(r).padStart(2, "0")}`,
       color: colors[k],
-      d,
-      nodes,
-      loops: loops.length,
+      fill: subShapes.length === 1 ? subShapes[0].fill : colors[k],
+      d: combinedD,
+      subShapes,
+      nodes: layerNodes,
+      loops: layerLoops,
       coverage: counts[k] / N,
+      kind: hasGradientInLayer ? "gradient" : "base",
     });
-    totalNodes += nodes;
-    totalLoops += loops.length;
+    totalNodes += layerNodes;
+    totalLoops += layerLoops;
   }
+
+  /* ---------- 6. Volumetric Lighting Glow & Anti-White-Spot Pass ---------- */
+  if (antiSpotStrength > 0) {
+    onProgress({ phase: "Synthesizing volumetric lighting & anti-spot glows", pct: 92 });
+    await tick();
+    const maxGlows = Math.round(14 * antiSpotStrength);
+    const glowEls = synthesizeLightingGlowLayers(
+      px,
+      predR,
+      predG,
+      predB,
+      gradMag,
+      W,
+      H,
+      scale,
+      maxGlows,
+      gradients,
+      filters
+    );
+    for (const el of glowEls) {
+      layers.push({
+        id: el.id,
+        color: el.colorHex,
+        fill: el.fill,
+        d: el.d || "",
+        subShapes: [
+          {
+            kind: el.kind === "g" ? "path" : el.kind,
+            fill: el.fill,
+            colorHex: el.colorHex,
+            d: el.d,
+            primitive: el.primitive,
+            opacity: el.opacity,
+            filterId: el.filterId,
+            clipPathId: el.clipPathId,
+            nodes: el.nodes,
+            loops: el.loops,
+          },
+        ],
+        filterId: el.filterId,
+        nodes: el.nodes,
+        loops: el.loops,
+        coverage: el.coverage,
+        kind: "lighting",
+      });
+      totalNodes += el.nodes;
+      totalLoops += el.loops;
+    }
+  }
+
+  /* ---------- 7. Residual Error-Driven Crisp Micro-Detail & Catchlight Pass ---------- */
+  if (enableResidual) {
+    onProgress({ phase: "Refining residual crisp details & catchlights", pct: 96 });
+    await tick();
+    const resEls = synthesizeResidualDetailLayers(
+      px,
+      predR,
+      predG,
+      predB,
+      W,
+      H,
+      scale,
+      opts.tolerance,
+      opts.cornerAngle,
+      opts.minArea,
+      8
+    );
+    for (const el of resEls) {
+      layers.push({
+        id: el.id,
+        color: el.colorHex,
+        fill: el.fill,
+        d: el.d || "",
+        subShapes: [
+          {
+            kind: el.kind === "g" ? "path" : el.kind,
+            fill: el.fill,
+            colorHex: el.colorHex,
+            d: el.d,
+            primitive: el.primitive,
+            nodes: el.nodes,
+            loops: el.loops,
+          },
+        ],
+        nodes: el.nodes,
+        loops: el.loops,
+        coverage: el.coverage,
+        kind: "residual",
+      });
+      totalNodes += el.nodes;
+      totalLoops += el.loops;
+    }
+  }
+
+  // Compute regional color accuracy across the image
+  let sePred = 0;
+  for (let i = 0; i < N; i++) {
+    const dr = px[i * 4] - predR[i];
+    const dg = px[i * 4 + 1] - predG[i];
+    const db = px[i * 4 + 2] - predB[i];
+    sePred += dr * dr + dg * dg + db * db;
+  }
+  const regionalColorAccuracy = 100 * (1 - sePred / (N * 3 * 255 * 255));
 
   onProgress({ phase: "Assembling SVG", pct: 99 });
   await tick();
   return {
     width: origW,
     height: origH,
-    background: colors[order[0]],
+    background: backgroundHex,
+    backgroundFill,
     layers,
+    gradients,
+    filters,
+    clipPaths,
     errors,
     colorHistory,
     nodes: totalNodes,
     loops: totalLoops,
+    regionalColorAccuracy,
     debug: (opts as any).debug ? { labels, colors, W, H } : undefined,
   };
 }
